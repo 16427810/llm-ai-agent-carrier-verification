@@ -1,0 +1,220 @@
+import os
+import asyncio
+import time
+from browser_use import Agent, Browser, BrowserConfig, Controller, ActionResult
+from browser_use.browser.context import BrowserContextConfig
+from langchain_openai import AzureChatOpenAI
+from pydantic import SecretStr
+import json
+import subprocess
+
+#load_dotenv()
+username = os.getenv("USERNAME")
+password = os.getenv("PASSWORD")
+
+
+chrome_path = “”
+TARIFF_WEBSITE = "“
+CARRIER_NAME = "ABC LLC"
+
+# --- Browser Setup ---
+browsercontextconfig = BrowserContextConfig(
+    save_recording_path="./recordings/",
+    viewport_expansion=-1,
+)
+
+config = BrowserConfig(
+    headless=HEADLESS,
+    chrome_instance_path=chrome_path,
+    disable_security=False,
+    new_context_config=browsercontextconfig,
+    extra_chromium_args=[
+        "--disable-web-security",
+        "--disable-features=IsolateOrigins,site-per-process,AutomaticHTTPSRewrites"
+    ]
+)
+
+# Close any existing Chrome remote debug sessions
+#subprocess.call("taskkill /IM chrome.exe /F", shell=True)
+#time.sleep(2)  # Give 2 seconds for Chrome to fully close
+
+
+# --- Define Task for AI agent ---
+task = f"""
+### Objective:
+Log into {TARIFF_WEBSITE}, search for and select {CARRIER_NAME}, extract its tariff information, and find Bill of Landing, save result to an Excel file
+
+### Steps:
+1. Navigate to: {TARIFF_WEBSITE}
+2. Fill Login credential with:
+   - Username: {dmtar_username} 
+   - Password: {dmtar_password}
+   Scroll down to find the 'Login' button. This is important, Login button is not visible without scrolling down.
+   The Login button is a blue rectangular button with white text centered in it that says "Login".
+   Click on the'Login' button immediately, don't hesitate, do not click on another buttons
+3. Search for the {CARRIER_NAME}:
+   - Click on the dropdown to focus it
+   - Then press the down arrow key repeatedly to scroll through the options until the {CARRIER_NAME} is visible
+   - Wait briefly between key presses to ensure the list scrolls smoothly
+   - When you see the {CARRIER_NAME}, try either:
+     - click on it (it should turn blue), then click "Show Tariffs", or:
+     - inout the number after {CARRIER_NAME} in search box, then click "Show Tariffs"
+4.  A 'List of Tariffs' window will show below
+5. In "List of Tariffs" window:
+   - Click the first/only tariff item, will turn blue if you successfully click on it, it always contains 'Tariff NO.'
+   - Click "Load Tariff" button (exact match)
+6. On loaded tariff page:
+   - Click "Tariff Contact Info" button
+   - Extract all visible contact and tariff information
+   - Return in a JSON file
+7. Click the "Rules/Surcharges" tab.
+   - Review all rule titles listed (left side panel or central list).
+   - Search for a rule that contains the term **"Bill(s) of Lading"** (case-insensitive).
+   - If such a rule exists:
+     - Return `"bill_of_lading_found": True`
+     - Click on that rule and return the current URL under `"bill_of_lading_url"`
+     - No need to return content from Bill of Lading page
+   - If no such rule exists:
+     - Return `"bill_of_lading_found": false`
+     - Do not return a URL.
+
+### Expected Output:
+An Excel file with:
+- The extracted contact and tariff details
+- A boolean field `"bill_of_lading_found"`
+- URL for "bill_of_lading_url"
+
+### Notes:
+- Use exact text matching for buttons
+- Type search term exactly as specified
+- Wait for UI stability between actions
+- First result selection must be precise
+- Include verification after each major action
+"""
+# add a controller for more stable performance
+controller = Controller()
+@controller.action("Extract Tariff Info and Check Bill of Lading")
+async def extract_tariff_and_check_bill(browser):
+    page = browser.get_current_page()
+
+    try:
+        # Step 1: Login
+        await page.wait_for_selector('input[name="User ID"]', timeout=5000)
+        await page.fill('input[name="User ID"]', username)
+        await page.fill('input[name="Password"]', password)
+        await page.click('button:has-text("Login")')
+
+        # Step 2: Wait for carrier dropdown
+        await page.wait_for_selector('select', timeout=12000)
+
+        # Step 3: Select carrier from dropdown
+        try:
+            await page.select_option('select', label=CARRIER_NAME)
+        except:
+            options = await page.query_selector_all('select option')
+            for option in options:
+                text = await option.text_content()
+                if CARRIER_NAME in text:
+                    await option.click()
+                    break
+            else:
+                return ActionResult(success=False, error_message=f"Carrier '{CARRIER_NAME}' not found")
+
+        await asyncio.sleep(1)
+
+        # Step 4: Click Show Tariffs
+        await page.click('input[value="Show Tariffs"]')
+        await asyncio.sleep(2)
+
+        # Step 5: Click first tariff in list
+        await page.wait_for_selector('text=List of Tariffs', timeout=5000)
+        tariff_items = await page.query_selector_all('a, button, div.clickable')
+        for item in tariff_items:
+            text = await item.text_content()
+            if "Tariff" in text:
+                await item.click()
+                break
+        else:
+            return ActionResult(success=False, error_message="No tariff item found")
+
+        await page.wait_for_selector('text=Load Tariff', timeout=5000)
+        await page.click('text=Load Tariff')
+        await asyncio.sleep(2)
+
+        # Step 6: Click Tariff Contact Info
+        await page.wait_for_selector('a:has-text("Tariff Contact Info")', timeout=8000)
+        await page.click('a:has-text("Tariff Contact Info")')
+        await asyncio.sleep(1)
+        body_text = await page.inner_text("body")
+
+        # Save initial contact info text
+        extracted_data = {"contact_info": body_text[:3000]}
+
+        # Step 7: Check for Bill of Lading in Rules
+        await page.click('a:has-text("Rules/Surcharges")')
+        await asyncio.sleep(2)
+        rules_text = await page.inner_text("body")
+
+        found = False
+        rule_links = await page.query_selector_all('a')
+        for link in rule_links:
+            text = await link.text_content()
+            if "bill" in text.lower() and "lading" in text.lower():
+                await link.click()
+                await asyncio.sleep(1)
+                extracted_data["bill_of_lading_found"] = True
+                extracted_data["bill_of_lading_url"] = page.url
+                found = True
+                break
+
+        if not found:
+            extracted_data["bill_of_lading_found"] = False
+
+        url = page.url  
+        return ActionResult(
+            success=True,
+            #message="Bill of Lading found",
+            extracted_content=json.dumps({
+                "bill_of_lading_found": True,
+                "bill_of_lading_url": url
+            })
+        )
+
+    except Exception as e:
+        return ActionResult(success=False, error_message=str(e))
+    
+async def main():
+    llm = AzureChatOpenAI(
+        model="gpt-4o-mini",
+        api_version="",
+        azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT'),
+        api_key=SecretStr(os.getenv('AZURE_OPENAI_API_KEY')),
+    )
+
+    browser = Browser(config=config)
+
+    agent = Agent(
+        browser=browser,
+        llm=llm,
+        initial_actions=[{'open_tab': {'url': TARIFF_WEBSITE}}],
+        task=task,
+        controller=controller,
+        use_vision=False,
+        save_conversation_path="./logs/"
+    )
+   
+    start_time = time.time()
+    history = await agent.run()
+    end_time = time.time()
+    time_spent = end_time - start_time
+
+    print(f"⏱️ Time spent: {time_spent:.2f} seconds")
+    print(history.final_result())
+
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.get_event_loop().run_until_complete(main())
+    except RuntimeError:
+        asyncio.run(main())
