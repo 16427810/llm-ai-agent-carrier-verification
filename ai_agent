@@ -47,8 +47,8 @@ Log into {TARIFF_WEBSITE}, search for and select {CARRIER_NAME}, extract its tar
 ### Steps:
 1. Navigate to: {TARIFF_WEBSITE}
 2. Fill Login credential with:
-   - Username: {dmtar_username} 
-   - Password: {dmtar_password}
+   - Username: {username} 
+   - Password: {password}
    Scroll down to find the 'Login' button. This is important, Login button is not visible without scrolling down.
    The Login button is a blue rectangular button with white text centered in it that says "Login".
    Click on the'Login' button immediately, don't hesitate, do not click on another buttons
